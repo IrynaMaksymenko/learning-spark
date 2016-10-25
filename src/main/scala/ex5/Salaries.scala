@@ -1,5 +1,6 @@
 package ex5
 
+import org.apache.commons.lang.StringUtils.{isNotEmpty, rightPad}
 import org.apache.spark.sql.Row
 import utils.SparkUtils
 
@@ -18,79 +19,62 @@ object Salaries {
     // file is packaged into jar so it must be on classpath
     val vacancies = sqlContext.read.json(getClass.getClassLoader.getResource("hh-vacs").getFile)
 
-    // we are interested only in next 3 positions
-    val desiredPositions: List[String] = List("developer", "designer", "admin")
-
-    // define parsing functions
-    val getPosition: ((Row, Int) => String) = parsePosition
-    val getCity: ((Row, Int) => String) = parseCity
-    val getSalary: ((Row, Int) => Long) = parseSalary
-
     val collectedData = vacancies
-      .select("address.city", "name", "salary")
-      // parse data and create map vacancy -> salary
-      .map(row => (new Vacancy(getCity(row, 0), getPosition(row, 1)), getSalary(row, 2)))
-      // filter invalid data
-      .filter(vacancyAndSalary =>
-        desiredPositions.contains(vacancyAndSalary._1.position)
-          && vacancyAndSalary._1.city
-          != "" && vacancyAndSalary._2 > 0)
-      // add counter
-      .mapValues((_, 1))
+      .na.drop(Seq("address", "name", "salary")) // skip rows with null in any of that columns
+      .select("address.city", "name", "salary.from", "salary.to", "salary.currency")
+      .na.drop(Seq("city", "currency")) // skip rows with null in any of that columns
+      .na.fill(0) // fill null numbers by 0s
+      // take only interesting vacations from all data set
+      .flatMap(parseInterestingVacations)
+      // create map vacancy(city and position) -> (salary, counter)
+      .map(row => (Vacancy(row.city, row.position), (row.salary, 1)))
       // sum up salaries by city and position
       .reduceByKey((s1, s2) => (s1._1 + s2._1, s1._2 + s2._2))
       // calculate average dividing sum by counter
-      .mapValues { case (sum, count) => sum / count }
+      .mapValues { case (sum, count) => (sum / count, count) }
       // return result to driver program
       .collect()
 
     // print sorted collected data in some kind of table
-    println("|______City______|____Position____|_Avg_Salary_USD_|")
+    println("|______City______|____Position____|_Avg_Salary_USD_|Num_of_vacations|")
     collectedData
       .sortBy(vc => (vc._1.city, vc._1.position))
-      .foreach(vc => println("|%s|%s|%s|".format(
-        getStringOfLength16(vc._1.city),
-        getStringOfLength16(vc._1.position),
-        getStringOfLength16(vc._2.toString))))
+      .foreach(vc => println("|%s|%s|%s|%s|".format(
+        rightPad(vc._1.city, 16, ' '),
+        rightPad(vc._1.position, 16, ' '),
+        rightPad(vc._2._1.toString, 16, ' '), // avg salary
+        rightPad(vc._2._2.toString, 16, ' ')))) // vacations count
 
   }
 
   case class Vacancy(city: String, position: String)
 
-  def parseSalary(row: Row, index: Int): Long = {
-    if (row.isNullAt(index)) return 0l
+  case class DataRow(city: String, position: String, salary: Long)
 
-    val salary: Row = row.getStruct(index)
-
-    val currency = if (salary.isNullAt(0)) "" else salary.getString(0)
-    val min = if (salary.isNullAt(1)) 0 else salary.getLong(1)
-    val max = if (salary.isNullAt(2)) 0 else salary.getLong(2)
-
-    var avg: Long = 0
-    if (min > 0 && max > 0) {
-      avg = (min + max) / 2
-    } else {
-      if (min > 0) {
-        avg = min
-      } else if (max > 0) {
-        avg = max
-      }
-    }
-
-    if (currency == "USD") avg
-    else if (currency == "RUR") avg / 64l
-    else 0l
+  def parseInterestingVacations(row: Row): Option[DataRow] = {
+    val city: String = row.getString(0)
+    val position = parsePosition(row.getString(1))
+    val salary = parseSalary(row.getLong(2), row.getLong(3), row.getString(4))
+    if (isNotEmpty(city) && !position.equals("other") && salary > 0) Some(DataRow(city, position, salary))
+    else None
   }
 
-  def parseCity(row: Row, index: Int): String = {
-    if (row.isNullAt(index)) "" else row.getString(index)
+  def parseSalary(from: Long, to: Long, currency: String): Long = {
+    // take average between min and max salary
+    // or bigger of two values if one of them is 0
+    val salary = Math.max(
+      if (from > 0 && to > 0) (from + to) / 2
+      else Math.max(from, to),
+      0)
+
+    // convert everything to USD
+    if ("USD".equals(currency)) salary
+    else if ("RUR".equals(currency)) salary / 64
+    else 0
   }
 
   // some positions can have different names but same meaning
-  def parsePosition(row: Row, index: Int): String = {
-    if (row.isNullAt(index)) return ""
-
-    val arg: String = row.getString(index)
+  def parsePosition(arg: String): String = {
     val lowerCase = arg.toLowerCase
     if (lowerCase.contains("developer") || lowerCase.contains("программист") || lowerCase.contains("разработчик"))
       "developer"
@@ -99,17 +83,6 @@ object Salaries {
     else if (lowerCase.contains("system administrator") || lowerCase.contains("системный администратор"))
       "admin"
     else "other"
-  }
-
-  // converts string to string with predefined length (of 16 symbols)
-  def getStringOfLength16(str: String): String = {
-    if (str.length() > 16) return str.substring(0, 16)
-    var result = str
-    val rest = 16-str.length()
-    for (i <- 1 to rest) {
-      result = result.concat(" ")
-    }
-    result
   }
 
 }
